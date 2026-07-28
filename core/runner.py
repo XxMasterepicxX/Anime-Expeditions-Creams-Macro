@@ -1563,10 +1563,9 @@ class MacroRunner(ChallengeOps, ExpeditionOps, BlockOps):
     def _apply_team_loadout(self, hwnd, stop_event: threading.Event, task: dict) -> bool:
         """Presses H to open the team-select panel, waits for it to
         actually open, clicks the task's Macro Operation template's
-        configured Team Loadout slot (1-8 in Creation's picker, though only
-        1-3 are positioned here -- 4+ need a scroll method not implemented
-        yet), clicks Confirm, picks Include/Exclude for equipment, then
-        presses H again to close the panel.
+        configured Team Loadout slot (1-8, scrolling for 4-8), clicks
+        Confirm, picks Include/Exclude for equipment, then presses H again
+        to close the panel.
 
         No team configured, an unrecognized/out-of-range slot number (a
         template config problem retrying can't fix either) still just skip
@@ -1637,47 +1636,78 @@ class MacroRunner(ChallengeOps, ExpeditionOps, BlockOps):
 
     def _apply_team_loadout_panel(self, hwnd, stop_event: threading.Event, team_match, team_num: int,
                                     equipment: str) -> bool:
-        vision.click_match(self._mouse, hwnd, team_match)
-        # The Loadout list animates in right after this click -- without a
-        # settle, the very next click (the Loadout row itself) can land
-        # before it's actually finished sliding into place.
-        time.sleep(SETTLE_DELAY)
+        # The "team" image proves only that the Unit Manager is open. Clicking
+        # it starts a second transition into the actual Load Team list. The
+        # old path waited a blind 0.3s and immediately scrolled/clicked; if
+        # this click was early or dropped, every later action landed against
+        # the wrong screen. Verify the destination's own title and retry THIS
+        # click before touching any loadout row.
+        loadout_open = None
+        for attempt in range(1, TEAM_LOADOUT_OPEN_RETRY_ATTEMPTS + 1):
+            if self._checkpoint(stop_event):
+                return False
+            if attempt > 1:
+                self._log(f'[Macro] Load Team list did not open -- retrying the Teams button '
+                           f'(attempt {attempt}/{TEAM_LOADOUT_OPEN_RETRY_ATTEMPTS}).')
+            vision.click_match(self._mouse, hwnd, team_match)
+            self._log("[Macro] Clicked Teams -- waiting for the Load Team list.")
+            try:
+                loadout_open = vision.wait_for_image(
+                    hwnd, "team_loadout_open", threshold=TEAM_LOADOUT_OPEN_THRESHOLD,
+                    timeout=TEAM_PANEL_TIMEOUT, stop_event=stop_event)
+            except vision.TemplateNotFound as exc:
+                self._log(f"[Macro] Can't verify the Load Team list: {exc}")
+                return False
+            if loadout_open is not None:
+                break
+            if stop_event.is_set():
+                return False
+        if loadout_open is None:
+            self._log(f'[Macro] Load Team list never opened after '
+                      f'{TEAM_LOADOUT_OPEN_RETRY_ATTEMPTS} Teams clicks.')
+            self._save_debug_screenshot_unconditional(hwnd, "team_loadout_open_failed")
+            return False
+        self._log(f'[Macro] Load Team list open (score {loadout_open["score"]:.2f}).')
+        # The title arrives before the row animation has completely settled.
+        time.sleep(TEAM_LOADOUT_OPEN_SETTLE)
         if self._checkpoint(stop_event):
             return False
 
         left, top, _, _ = wm.get_window_rect_screen(hwnd)
         row1_x, row1_y = self._cxy("team_loadout")  # Loadout 1's row (Settings > Debug > Macro Coordinates)
+        row_x = row1_x + TEAM_LOADOUT_BUTTON_CENTER_X_OFFSET
         if team_num > 3:
-            # A click-drag on the list itself, not a wheel scroll -- 7/8
-            # need a bigger drag that re-anchors the list differently
-            # (their own fixed row positions below), while 4-6's smaller
-            # drag just shifts the list enough to put them at the same row
-            # positions the 1-3 formula already computes.
-            scroll_amount = TEAM_LOADOUT_SCROLL_LARGE if team_num >= 7 else TEAM_LOADOUT_SCROLL_SMALL
-            anchor_x = left + TEAM_LOADOUT_SCROLL_ANCHOR[0]
-            anchor_y = top + TEAM_LOADOUT_SCROLL_ANCHOR[1]
-            self._log(f"[Macro] Scrolling the Loadout list to reach {team_num}...")
-            self._mouse.drag(anchor_x, anchor_y, anchor_x, anchor_y + scroll_amount)
+            # Dragging from the old (895, 285) point was unreliable for two
+            # separate reasons confirmed against the live Windows UI: that
+            # point is on the Load Team button, not the scrollbar, and the
+            # 300px drag for slots 7/8 leaves the panel before mouse-up. Move
+            # over the real scrollbar and send ordinary wheel notches
+            # instead. Each notch shifts the rows by a stable 100px.
+            scroll_steps = min(team_num, TEAM_LOADOUT_WHEEL_MAX_STEPS)
+            hover_x = left + TEAM_LOADOUT_SCROLLBAR_HOVER[0]
+            hover_y = top + TEAM_LOADOUT_SCROLLBAR_HOVER[1]
+            self._mouse.move_to(hover_x, hover_y)
+            time.sleep(TEAM_LOADOUT_SCROLL_HOVER_SETTLE)
+            self._mouse.nudge()
+            for _ in range(scroll_steps):
+                self._mouse.scroll(TEAM_LOADOUT_WHEEL_DELTA)
+                time.sleep(TEAM_LOADOUT_WHEEL_INTERVAL)
             time.sleep(TEAM_LOADOUT_SCROLL_SETTLE)
             if self._checkpoint(stop_event):
                 return False
-
-        if team_num == 7:
-            row_y = TEAM_LOADOUT_SLOT_7_Y
-        elif team_num == 8:
-            row_y = TEAM_LOADOUT_SLOT_8_Y
-        elif team_num > 3:
-            # 4-6 scrolled into the SAME row slots 1-3 sit in pre-scroll (see
-            # the drag comment above) -- team_num must be rebased against
-            # row 1 the way 1-3 already are (team_num - 1), not counted as
-            # if the list never moved. Using (team_num - 1) unscrolled here
-            # undercounted the shift by exactly the 3 rows the drag just
-            # revealed, landing the click 3 * TEAM_LOADOUT_ROW_HEIGHT (378px)
-            # below the real row -- past the panel and onto the game view
-            # behind it, which is what turned into "the click/scroll goes
-            # way too far, outside Roblox" for teams 5-6 (4 was off too, by
-            # the same bug, just closer to a row that still did something).
-            row_y = row1_y + (team_num - 4) * int(self._coords["team_loadout_row_height"])
+            # Current rows are 137px apart. Account for the 100px movement
+            # from each wheel notch to click the requested row where it
+            # actually landed. Slot 8 bottoms out with only the top of its
+            # green button visible, so cap the click at the verified visible
+            # part of that button.
+            row_y = (
+                row1_y
+                + (team_num - 1) * TEAM_LOADOUT_CURRENT_ROW_HEIGHT
+                - scroll_steps * TEAM_LOADOUT_WHEEL_ROW_SHIFT
+            )
+            row_y = min(row_y, TEAM_LOADOUT_VISIBLE_BOTTOM_Y)
+            self._log(f"[Macro] Scrolled {scroll_steps} notch(es); Loadout {team_num} "
+                      f"is at ({row_x}, {row_y}).")
         else:
             row_y = row1_y + (team_num - 1) * int(self._coords["team_loadout_row_height"])
 
@@ -1696,7 +1726,7 @@ class MacroRunner(ChallengeOps, ExpeditionOps, BlockOps):
             if attempt > 1:
                 self._log(f'[Macro] "confirm" didn\'t show up -- retrying Loadout {team_num} '
                            f'(attempt {attempt}/{TEAM_LOADOUT_CONFIRM_RETRY_ATTEMPTS}).')
-            self._mouse.click(left + row1_x, top + row_y)
+            self._mouse.click(left + row_x, top + row_y)
             self._log(f"[Macro] Clicked Loadout {team_num}.")
             # Let the Confirm button finish sliding up before locating it --
             # otherwise it's found mid-animation and the click lands where it
@@ -1717,28 +1747,26 @@ class MacroRunner(ChallengeOps, ExpeditionOps, BlockOps):
         if confirm_match is None:
             self._log(f'[Macro] "confirm" never showed up after {TEAM_LOADOUT_CONFIRM_RETRY_ATTEMPTS} attempts -- '
                        f'Team Loadout {team_num} was NOT applied.')
+            self._save_debug_screenshot_unconditional(hwnd, "team_loadout_confirm_failed")
             return False
         vision.click_match(self._mouse, hwnd, confirm_match)
         self._log("[Macro] Clicked Confirm.")
         if self._checkpoint(stop_event):
             return False
 
-        # Whichever of include.png/exclude.png matches the configured
-        # choice -- optional like nav_disband and friends: if that specific
-        # image hasn't been added yet, this just logs and moves on to
-        # closing the panel instead of failing the whole sequence over it.
-        # The team itself is already equipped by this point (Confirm just
-        # landed) -- unlike a missing Confirm, a missing equipment choice
-        # doesn't leave the match with the wrong team, just the wrong
-        # equipment setting, so it stays best-effort.
+        # Confirm opens a second, required modal for the configured equipment
+        # choice.  Do not silently continue when it cannot be read: that
+        # starts the match with a different loadout than the template asked
+        # for.  Keep a screenshot of the unread screen so future game-art
+        # changes can be diagnosed from the actual failed frame.
         try:
             equip_match = vision.wait_for_image(hwnd, equipment, timeout=TEAM_PANEL_TIMEOUT, stop_event=stop_event)
-        except vision.TemplateNotFound:
+        except vision.TemplateNotFound as exc:
             equip_match = None
-            self._log(f'[Macro] No Assets/ui/{equipment}.png yet -- skipping the equipment choice.')
+            self._log(f"[Macro] Can't detect the {equipment} equipment option: {exc}")
         if equip_match is not None:
             vision.click_match(self._mouse, hwnd, equip_match)
-            self._log(f"[Macro] Equipment: {equipment}.")
+            self._log(f'[Macro] Equipment: {equipment} (score {equip_match["score"]:.2f}).')
             # Without a settle here, the caller's finally-block H tap (see
             # _apply_team_loadout) fires on the very next line -- pressing H
             # to close the panel before this click has actually registered
@@ -1746,8 +1774,11 @@ class MacroRunner(ChallengeOps, ExpeditionOps, BlockOps):
             # at all and can leave the panel stuck in a half-closed state.
             time.sleep(0.5)
         elif not stop_event.is_set():
-            self._log(f'[Macro] "{equipment}" option never showed up -- skipping the equipment choice.')
-        return True
+            self._log(f'[Macro] "{equipment}" option never showed up -- Team Loadout '
+                      f'{team_num} was not fully applied.')
+            self._save_debug_screenshot_unconditional(hwnd, f"team_loadout_{equipment}_failed")
+            return False
+        return equip_match is not None
 
 
 
